@@ -70,16 +70,102 @@ class TensoRF(nn.Module):
         rendered_colors = torch.sum(weights.unsqueeze(-1)*colors, dim=1)
         return rendered_colors
 
+    def trilinear_interpolation(self, feature_grid, samples):
+        """
+        Perform custom trilinear interpolation on a 3D feature grid.
+        
+        Args:
+            feature_grid: Tensor of shape [1, C, D, H, W], the 3D feature volume.
+            samples: Tensor of shape [N, 1, 3] with normalized coords in [-1,1].
+                    We assume S=1, so effectively one sample per N.
+                    
+                    Coordinate order: samples[..., 0] = x in [-1,1]
+                                    samples[..., 1] = y in [-1,1]
+                                    samples[..., 2] = z in [-1,1]
+
+                    Mapping:
+                    x -> W dimension
+                    y -> H dimension
+                    z -> D dimension
+
+        Returns:
+            features: [N, 1, C] tensor of interpolated features.
+        """
+        assert samples.dim() == 3 and samples.size(1) == 1, "samples should be [N,1,3]"
+        
+        N = samples.size(0)
+        C = feature_grid.size(1)
+        D = feature_grid.size(2)
+        H = feature_grid.size(3)
+        W = feature_grid.size(4)
+
+        # Squeeze S dimension: [N,3]
+        coords = samples.squeeze(1)  
+
+        # Convert normalized [-1,1] coords to voxel coordinates
+        coords_x = ((coords[:,0] + 1) / 2) * (W - 1)
+        coords_y = ((coords[:,1] + 1) / 2) * (H - 1)
+        coords_z = ((coords[:,2] + 1) / 2) * (D - 1)
+
+        # Floor and clamp to get base voxel indices
+        x0 = coords_x.floor().clamp(0, W-1).long()
+        y0 = coords_y.floor().clamp(0, H-1).long()
+        z0 = coords_z.floor().clamp(0, D-1).long()
+
+        # Next voxel indices, clamped
+        x1 = (x0 + 1).clamp(max=W-1)
+        y1 = (y0 + 1).clamp(max=H-1)
+        z1 = (z0 + 1).clamp(max=D-1)
+
+        # Compute interpolation weights
+        xd = (coords_x - x0.float()).unsqueeze(1)  # [N,1]
+        yd = (coords_y - y0.float()).unsqueeze(1)  # [N,1]
+        zd = (coords_z - z0.float()).unsqueeze(1)  # [N,1]
+
+        xdi = 1 - xd
+        ydi = 1 - yd
+        zdi = 1 - zd
+
+        # Helper to gather values from feature_grid
+        # feature_grid: [1, C, D, H, W]
+        # Index order is z, y, x
+        def gather_values(ix, iy, iz):
+            # ix, iy, iz: [N], indexing into W,H,D respectively
+            # shape after indexing: [N,C]
+            return feature_grid[0, :, iz, iy, ix].transpose(0,1)
+
+        c000 = gather_values(x0, y0, z0) # [N,C]
+        c100 = gather_values(x1, y0, z0)
+        c010 = gather_values(x0, y1, z0)
+        c001 = gather_values(x0, y0, z1)
+        c110 = gather_values(x1, y1, z0)
+        c101 = gather_values(x1, y0, z1)
+        c011 = gather_values(x0, y1, z1)
+        c111 = gather_values(x1, y1, z1)
+
+        # Apply trilinear interpolation formula
+        # Each corner: [N,C], multiply by [N,1] weights => broadcasting works
+        c000 = c000 * xdi * ydi * zdi
+        c100 = c100 * xd  * ydi * zdi
+        c010 = c010 * xdi * yd  * zdi
+        c001 = c001 * xdi * ydi * zd
+        c110 = c110 * xd  * yd  * zdi
+        c101 = c101 * xd  * ydi * zd
+        c011 = c011 * xdi * yd  * zd
+        c111 = c111 * xd  * yd  * zd
+
+        interpolated = c000 + c100 + c010 + c001 + c110 + c101 + c011 + c111  # [N,C]
+
+        # Return [N,1,C] to match grid_sample's output shape
+        return interpolated.unsqueeze(1)
+
     def sample_features(self, samples):
-        size = self.feature_grid.shape[-1]
-        grid_coords = 2.0*(samples/(size-1)) - 1.0
-
-        N, S, _ = samples.shape
-        flat_samples = samples.view(1, 1, N*S, 1, 3)
-        flat_grid = grid_sample(self.feature_grid, flat_samples, align_corners=True)
-
-        features = flat_grid.view(32, N, S).permute(1, 2, 0)
+        # samples: [N,S,3], with S=1
+        assert samples.size(1) == 1
+        # Interpolate
+        features = trilinear_interpolation(self.feature_grid, samples)
         return features
+
 
     def compute_weights(self, densities, t_vals):
         deltas = t_vals[:, 1:] - t_vals[:, :-1]
